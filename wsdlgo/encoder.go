@@ -591,7 +591,7 @@ var soapFuncT = template.Must(template.New("soapFunc").Funcs(template.FuncMap{
 func (p *{{.PortType}}) {{.Name}}( {{functionParamString .InParams}}) ({{functionParamString .OutParams}}) {
 	// request message
 	message := struct {
-		XMLName xml.Name ` + "`" + `xml:"{{.MessageName}}"` + "`" + `
+		XMLName xml.Name ` + "`" + `xml:"{{.MessageNameIn}}"` + "`" + `
 {{- range .InParams }}
 		{{fieldNameString .Name}} {{.Type}} ` + "`" + `xml:"{{.XMLName}}"` + "`" + `
 {{- end }}
@@ -605,11 +605,13 @@ func (p *{{.PortType}}) {{.Name}}( {{functionParamString .InParams}}) ({{functio
 	out := struct {
 		XMLName xml.Name ` + "`xml:\"Envelope\"`" + `
 		Body struct {
+			Message struct {
 {{- range .OutParams }}
 {{- 	if ne .Name "err" }}
-			{{fieldNameString .Name}} {{.Type}} ` + "`" + `name:"{{.XMLName}},omitempty"` + "`" + `
+				{{fieldNameString .Name}} {{.Type}} ` + "`" + `xml:"{{.XMLName}},omitempty"` + "`" + `
 {{- 	end }}
 {{- end }}
+			} ` + "`" + `xml:"{{.MessageNameOut}}"` + "`" + `
 		}
 	}{}
 	
@@ -621,7 +623,7 @@ func (p *{{.PortType}}) {{.Name}}( {{functionParamString .InParams}}) ({{functio
 
 {{- range .OutParams }}
 {{- 	if ne .Name "err" }}
-	{{.Name}} = out.Body.{{fieldNameString .Name}}
+	{{.Name}} = out.Body.Message.{{fieldNameString .Name}}
 {{- 	end }}
 {{- end }}
 
@@ -643,19 +645,21 @@ func (ge *goEncoder) writeSOAPFunc(w io.Writer, d *wsdl.Definitions, op *wsdl.Op
 		soapAction = soapOp.Operation.SoapAction
 	}
 	soapFuncT.Execute(w, &struct {
-		PortType    string
-		Name        string
-		InParams    []*parameter
-		SoapAction  string
-		OutParams   []*parameter
-		MessageName string
+		PortType       string
+		Name           string
+		InParams       []*parameter
+		SoapAction     string
+		OutParams      []*parameter
+		MessageNameIn  string
+		MessageNameOut string
 	}{
 		strings.ToLower(d.PortType.Name[:1]) + d.PortType.Name[1:],
 		strings.Title(op.Name),
 		inParams,
 		soapAction,
 		outParams,
-		op.Name,
+		trimns(op.Name),
+		trimns(op.Output.Message),
 	})
 	return true
 }
@@ -782,6 +786,9 @@ func scrubName(unscrubbed string) (name string) {
 func (ge *goEncoder) genParams(parts []*wsdl.Part, needsTag bool) []*parameter {
 	params := make([]*parameter, len(parts))
 	for i, part := range parts {
+
+		name := scrubName(part.Name)
+
 		var t string
 		switch {
 		case part.Type != "":
@@ -790,12 +797,20 @@ func (ge *goEncoder) genParams(parts []*wsdl.Part, needsTag bool) []*parameter {
 			t = ge.wsdl2goType(part.Element)
 		}
 
-		name := scrubName(part.Name)
+		xmlName := part.Name
+		ct, ok := ge.ctypes[strings.TrimPrefix(t, "*")]
+		if ok && isArray(ct) {
+			// SOAP wraps array elements in an element of the same name
+			// Its likely this isn't structured properly for multi-dimensional arrays--which might
+			// be presented in any number of ways and deserialised any other number of ways
+			// without working WSDL AND and service to test actual structure; leaving as issue for later.
+			xmlName = part.Name + ">" + part.Name
+		}
 
 		params[i] = &parameter{
 			Name:    name,
 			Type:    t,
-			XMLName: part.Name,
+			XMLName: xmlName,
 		}
 		if needsTag {
 			ge.needsTag[strings.TrimPrefix(t, "*")] = true
@@ -1027,6 +1042,14 @@ func (ge *goEncoder) genValidator(w io.Writer, typeName string, r *wsdl.Restrict
 	})
 }
 
+func isArray(ct *wsdl.ComplexType) bool {
+	return ct.ComplexContent != nil &&
+		ct.ComplexContent.Restriction != nil &&
+		trimns(ct.ComplexContent.Restriction.Base) == "Array" &&
+		ct.ComplexContent.Restriction.Attribute != nil &&
+		ct.ComplexContent.Restriction.Attribute.Key == "arrayType"
+}
+
 func (ge *goEncoder) genGoStruct(w io.Writer, d *wsdl.Definitions, ct *wsdl.ComplexType) error {
 	if ct.Abstract {
 		return nil
@@ -1047,17 +1070,14 @@ func (ge *goEncoder) genGoStruct(w io.Writer, d *wsdl.Definitions, ct *wsdl.Comp
 	writeComments(w, name, ct.Doc)
 
 	// Do array search
-	if ct.ComplexContent != nil && ct.ComplexContent.Restriction != nil && ct.ComplexContent.Restriction.Attribute != nil {
-		// Check that restriction base is "soapenc:Array"
-		if "Array" == trimns(ct.ComplexContent.Restriction.Base) && ct.ComplexContent.Restriction.Attribute.Key == "arrayType" {
-			wsdlType := ct.ComplexContent.Restriction.Attribute.Value
-			wsdlArrayOf := trimns(wsdlType)
-			matches := regexp.MustCompile("([^\\[\\]]+)(.+)").FindStringSubmatch(wsdlArrayOf)
-			goArrayOf := matches[1]
-			dimensions := matches[2]
-			fmt.Fprintf(w, "type %s %s%s\n\n", name, dimensions, goArrayOf)
-			return nil
-		}
+	if isArray(ct) {
+		wsdlType := ct.ComplexContent.Restriction.Attribute.Value
+		wsdlArrayOf := trimns(wsdlType)
+		matches := regexp.MustCompile("([^\\[\\]]+)(.+)").FindStringSubmatch(wsdlArrayOf)
+		goArrayOf := matches[1]
+		dimensions := matches[2]
+		fmt.Fprintf(w, "type %s %s%s\n\n", name, dimensions, goArrayOf)
+		return nil
 	}
 
 	if ct.Sequence != nil && ct.Sequence.Any != nil {
